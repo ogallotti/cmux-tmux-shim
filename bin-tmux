@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+# cmux-tmux-shim: Translates tmux commands to cmux equivalents
+# Enables Claude Code agent teams split-pane mode inside cmux
+#
+# When inside cmux (CMUX_WORKSPACE_ID is set), intercepts tmux calls
+# and maps them to cmux CLI commands. Outside cmux, passes through to real tmux.
+
+REAL_TMUX="/opt/homebrew/bin/tmux"
+
+# Pass through to real tmux when not inside cmux
+if [[ -z "${CMUX_WORKSPACE_ID:-}" ]]; then
+    exec "$REAL_TMUX" "$@"
+fi
+
+# --- State management ---
+SHIM_DIR="${HOME}/.local/state/cmux-tmux-shim"
+PANE_MAP="${SHIM_DIR}/pane-map"
+COUNTER_FILE="${SHIM_DIR}/counter"
+LOG_FILE="${SHIM_DIR}/shim.log"
+mkdir -p "$SHIM_DIR"
+
+[[ -f "$COUNTER_FILE" ]] || echo "0" > "$COUNTER_FILE"
+[[ -f "$PANE_MAP" ]] || touch "$PANE_MAP"
+
+# Debug logging (CMUX_TMUX_SHIM_DEBUG=1 to enable)
+log() {
+    [[ "${CMUX_TMUX_SHIM_DEBUG:-}" == "1" ]] && echo "[$(date +%H:%M:%S)] $*" >> "$LOG_FILE"
+    return 0
+}
+
+log "CMD: tmux $*"
+
+# --- Helpers ---
+
+# Atomic pane ID allocation via mkdir lock (portable, no flock needed)
+next_pane_id() {
+    local lock="${SHIM_DIR}/counter.lock"
+    while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+    local count
+    count=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    echo "$count" > "$COUNTER_FILE"
+    rmdir "$lock" 2>/dev/null || true
+    echo "%${count}"
+}
+
+store_map() {
+    local tmux_id="$1" cmux_id="$2"
+    if [[ -f "$PANE_MAP" ]]; then
+        grep -v "^${tmux_id}=" "$PANE_MAP" > "${PANE_MAP}.tmp" 2>/dev/null || true
+        mv "${PANE_MAP}.tmp" "$PANE_MAP"
+    fi
+    echo "${tmux_id}=${cmux_id}" >> "$PANE_MAP"
+    log "MAP: ${tmux_id} -> ${cmux_id}"
+}
+
+lookup_surface() {
+    grep "^${1}=" "$PANE_MAP" 2>/dev/null | tail -1 | cut -d= -f2
+}
+
+lookup_pane() {
+    grep "=${1}$" "$PANE_MAP" 2>/dev/null | tail -1 | cut -d= -f1
+}
+
+# Resolve a tmux pane ID (%N) or session:window target to cmux surface ref
+resolve_pane() {
+    local id="$1"
+    local surface
+    surface=$(lookup_surface "$id")
+    if [[ -n "$surface" ]]; then
+        echo "$surface"
+    else
+        echo "$id"
+    fi
+}
+
+# Resolve current surface: CMUX_SURFACE_ID can be a UUID or a ref
+resolve_current_surface() {
+    local sid="${CMUX_SURFACE_ID:-}"
+    if [[ -z "$sid" ]]; then
+        echo "surface:1"
+        return
+    fi
+    if [[ "$sid" == surface:* ]]; then
+        echo "$sid"
+        return
+    fi
+    local ref
+    ref=$(cmux identify 2>/dev/null | grep -o '"surface_ref" *: *"[^"]*"' | head -1 | grep -o 'surface:[0-9]*')
+    echo "${ref:-surface:1}"
+}
+
+# Ensure leader pane (%0) is mapped. Trusted once set, never reset.
+ensure_leader_mapped() {
+    local stored
+    stored=$(lookup_surface "%0")
+    [[ -n "$stored" ]] && return 0
+    local surface
+    surface=$(resolve_current_surface)
+    store_map "%0" "$surface"
+}
+
+ensure_leader_mapped
+
+# --- Strip -L <socket> prefix (external session mode) ---
+args=("$@")
+if [[ "${args[0]:-}" == "-L" ]]; then
+    log "SOCKET: ${args[1]:-}"
+    args=("${args[@]:2}")
+fi
+
+cmd="${args[0]:-}"
+cmd_args=("${args[@]:1}")
+
+# --- Command dispatch ---
+case "$cmd" in
+
+    -V)
+        echo "tmux 3.6a"
+        ;;
+
+    # ── display-message ──────────────────────────────────────────────
+    display-message)
+        target="" format="" print=false
+        i=0; while [[ $i -lt ${#cmd_args[@]} ]]; do
+            case "${cmd_args[$i]}" in
+                -p) print=true ;;
+                -t) ((i++)); target="${cmd_args[$i]:-}" ;;
+                *) format="${cmd_args[$i]}" ;;
+            esac; ((i++))
+        done
+
+        if [[ "$print" == true && -n "$format" ]]; then
+            # Token replacement for combined format strings
+            result="$format"
+            if [[ "$result" == *"pane_id"* ]]; then
+                if [[ -n "$target" ]]; then
+                    result="${result//\#\{pane_id\}/$target}"
+                else
+                    surface=$(resolve_current_surface)
+                    existing=$(lookup_pane "$surface")
+                    if [[ -z "$existing" ]]; then
+                        existing=$(next_pane_id)
+                        store_map "$existing" "$surface"
+                    fi
+                    result="${result//\#\{pane_id\}/$existing}"
+                fi
+            fi
+            result="${result//\#\{session_name\}/cmux}"
+            result="${result//\#\{window_index\}/0}"
+            result="${result//\#\{pane_index\}/0}"
+            echo "$result"
+        fi
+        ;;
+
+    # ── split-window ─────────────────────────────────────────────────
+    split-window)
+        target="" direction="right" size=""
+        i=0; while [[ $i -lt ${#cmd_args[@]} ]]; do
+            case "${cmd_args[$i]}" in
+                -t) ((i++)); target="${cmd_args[$i]:-}" ;;
+                -h) direction="right" ;;
+                -v) direction="down" ;;
+                -l|-p) ((i++)); size="${cmd_args[$i]:-}" ;;
+                -c) ((i++)) ;; # cwd — handled by agent via send-keys
+                -d) ;;         # don't focus
+                -P) ;;
+                -F) ((i++)) ;;
+                *) ;;
+            esac; ((i++))
+        done
+
+        # Layout: first split from leader = right, subsequent = down (vertical stack)
+        if [[ "$target" != "%0" ]]; then
+            direction="down"
+        else
+            direction="right"
+        fi
+
+        # Resolve cmux surface for target pane
+        split_args=("$direction")
+        if [[ -n "$target" ]]; then
+            cmux_surface=$(resolve_pane "$target")
+            if [[ "$cmux_surface" != "$target" ]]; then
+                split_args+=(--surface "$cmux_surface")
+            fi
+        fi
+
+        result=$(cmux new-split "${split_args[@]}" 2>&1)
+        new_surface=$(echo "$result" | grep -o 'surface:[0-9]*')
+
+        if [[ -n "$new_surface" ]]; then
+            pane_id=$(next_pane_id)
+            store_map "$pane_id" "$new_surface"
+            log "SPLIT: $direction target=$target -> $pane_id ($new_surface)"
+            echo "$pane_id"
+        else
+            log "SPLIT FAILED: $result"
+            exit 1
+        fi
+        ;;
+
+    # ── send-keys ────────────────────────────────────────────────────
+    send-keys)
+        target="" literal=false
+        keys=()
+        i=0; while [[ $i -lt ${#cmd_args[@]} ]]; do
+            case "${cmd_args[$i]}" in
+                -t) ((i++)); target="${cmd_args[$i]:-}" ;;
+                -l) literal=true ;;
+                *) keys+=("${cmd_args[$i]}") ;;
+            esac; ((i++))
+        done
+
+        surface_args=()
+        if [[ -n "$target" ]]; then
+            cmux_surface=$(resolve_pane "$target")
+            if [[ "$cmux_surface" != "$target" ]]; then
+                surface_args=(--surface "$cmux_surface")
+            fi
+        fi
+
+        # Build text, translating tmux key names to actual characters
+        text=""
+        for k in "${keys[@]}"; do
+            if [[ "$literal" == true ]]; then
+                text+="$k"
+                continue
+            fi
+            case "$k" in
+                Enter|enter|C-m)  text+=$'\n' ;;
+                Space|space)      text+=" " ;;
+                Tab|tab)          text+=$'\t' ;;
+                BSpace|bspace)    text+=$'\x7f' ;;
+                Escape|escape)    cmux send-key "${surface_args[@]}" escape >/dev/null 2>&1 || true; continue ;;
+                C-c)              cmux send-key "${surface_args[@]}" ctrl+c >/dev/null 2>&1 || true; continue ;;
+                C-d)              cmux send-key "${surface_args[@]}" ctrl+d >/dev/null 2>&1 || true; continue ;;
+                C-l)              cmux send-key "${surface_args[@]}" ctrl+l >/dev/null 2>&1 || true; continue ;;
+                C-z)              cmux send-key "${surface_args[@]}" ctrl+z >/dev/null 2>&1 || true; continue ;;
+                *)                text+="$k" ;;
+            esac
+        done
+        if [[ -n "$text" ]]; then
+            cmux send "${surface_args[@]}" "$text" >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    # ── select-pane ──────────────────────────────────────────────────
+    select-pane)
+        target="" title="" style=""
+        i=0; while [[ $i -lt ${#cmd_args[@]} ]]; do
+            case "${cmd_args[$i]}" in
+                -t) ((i++)); target="${cmd_args[$i]:-}" ;;
+                -T) ((i++)); title="${cmd_args[$i]:-}" ;;
+                -P) ((i++)); style="${cmd_args[$i]:-}" ;;
+                -U|-D|-L|-R) ;; # direction focus — ignore
+                *) ;;
+            esac; ((i++))
+        done
+
+        if [[ -n "$target" ]]; then
+            cmux_surface=$(resolve_pane "$target")
+            if [[ "$cmux_surface" != "$target" ]]; then
+                if [[ -n "$title" ]]; then
+                    cmux rename-tab --surface "$cmux_surface" "$title" >/dev/null 2>&1 || true
+                fi
+                if [[ -z "$title" && -z "$style" ]]; then
+                    cmux focus-panel --panel "$cmux_surface" >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+        ;;
+
+    # ── kill-pane ────────────────────────────────────────────────────
+    kill-pane)
+        target=""
+        i=0; while [[ $i -lt ${#cmd_args[@]} ]]; do
+            case "${cmd_args[$i]}" in
+                -t) ((i++)); target="${cmd_args[$i]:-}" ;;
+                *) ;;
+            esac; ((i++))
+        done
+
+        if [[ -n "$target" ]]; then
+            cmux_surface=$(resolve_pane "$target")
+            if [[ "$cmux_surface" != "$target" ]]; then
+                cmux close-surface --surface "$cmux_surface" >/dev/null 2>&1 || true
+                log "KILLED: $target ($cmux_surface)"
+            fi
+        fi
+        ;;
+
+    # ── list-panes ───────────────────────────────────────────────────
+    list-panes)
+        # ONLY return panes in our map — prevents discovering extra surfaces
+        # from other tabs and gives Claude Code accurate pane counts
+        if [[ -f "$PANE_MAP" && -s "$PANE_MAP" ]]; then
+            cut -d= -f1 "$PANE_MAP"
+        fi
+        ;;
+
+    # ── capture-pane ─────────────────────────────────────────────────
+    capture-pane)
+        target="" print=false
+        i=0; while [[ $i -lt ${#cmd_args[@]} ]]; do
+            case "${cmd_args[$i]}" in
+                -t) ((i++)); target="${cmd_args[$i]:-}" ;;
+                -p) print=true ;;
+                -S|-E) ((i++)) ;; # start/end line — ignore
+                -J) ;;            # join lines
+                *) ;;
+            esac; ((i++))
+        done
+
+        cap_args=()
+        if [[ -n "$target" ]]; then
+            cmux_surface=$(resolve_pane "$target")
+            if [[ "$cmux_surface" != "$target" ]]; then
+                cap_args=(--surface "$cmux_surface")
+            fi
+        fi
+        cmux capture-pane "${cap_args[@]}" 2>/dev/null || true
+        ;;
+
+    # ── resize-pane ──────────────────────────────────────────────────
+    resize-pane)
+        target="" direction="-R" amount="5" absolute=false
+        i=0; while [[ $i -lt ${#cmd_args[@]} ]]; do
+            case "${cmd_args[$i]}" in
+                -t) ((i++)); target="${cmd_args[$i]:-}" ;;
+                -x|-y) absolute=true; ((i++)) ;; # absolute — not supported
+                -L) direction="-L" ;;
+                -R) direction="-R" ;;
+                -U) direction="-U" ;;
+                -D) direction="-D" ;;
+                [0-9]*) amount="${cmd_args[$i]}" ;;
+                *) ;;
+            esac; ((i++))
+        done
+
+        if [[ "$absolute" == true ]]; then
+            log "UNSUPPORTED: resize-pane absolute sizing"
+        elif [[ -n "$target" ]]; then
+            cmux_surface=$(resolve_pane "$target")
+            if [[ "$cmux_surface" != "$target" ]]; then
+                cmux resize-pane --pane "$cmux_surface" "$direction" --amount "$amount" >/dev/null 2>&1 || true
+            fi
+        fi
+        ;;
+
+    # ── new-session ──────────────────────────────────────────────────
+    new-session)
+        session_name="" print=false
+        i=0; while [[ $i -lt ${#cmd_args[@]} ]]; do
+            case "${cmd_args[$i]}" in
+                -d) ;;
+                -s) ((i++)); session_name="${cmd_args[$i]:-}" ;;
+                -n) ((i++)) ;;
+                -P) print=true ;;
+                -F) ((i++)) ;;
+                -A) ;;
+                -c) ((i++)) ;;
+                --) break ;;
+                *) ;;
+            esac; ((i++))
+        done
+
+        [[ "$session_name" == "claude-hidden" ]] && exit 0
+
+        if [[ "$print" == true ]]; then
+            result=$(cmux new-split right 2>&1)
+            new_surface=$(echo "$result" | grep -o 'surface:[0-9]*')
+            if [[ -n "$new_surface" ]]; then
+                pane_id=$(next_pane_id)
+                store_map "$pane_id" "$new_surface"
+                echo "$pane_id"
+            fi
+        fi
+        ;;
+
+    # ── new-window ───────────────────────────────────────────────────
+    new-window)
+        print=false
+        i=0; while [[ $i -lt ${#cmd_args[@]} ]]; do
+            case "${cmd_args[$i]}" in
+                -t|-n) ((i++)) ;;
+                -P) print=true ;;
+                -F) ((i++)) ;;
+                -d) ;;
+                *) ;;
+            esac; ((i++))
+        done
+
+        result=$(cmux new-split right 2>&1)
+        new_surface=$(echo "$result" | grep -o 'surface:[0-9]*')
+        if [[ -n "$new_surface" ]]; then
+            pane_id=$(next_pane_id)
+            store_map "$pane_id" "$new_surface"
+            [[ "$print" == true ]] && echo "$pane_id"
+        fi
+        ;;
+
+    # ── has-session ──────────────────────────────────────────────────
+    has-session)
+        # Always succeed — cmux is running if we got here
+        exit 0
+        ;;
+
+    # ── list-sessions ────────────────────────────────────────────────
+    list-sessions|ls)
+        echo "cmux: 1 windows (created $(date))"
+        ;;
+
+    # ── Silent no-ops ────────────────────────────────────────────────
+    select-layout|set-option|set-window-option|set)
+        log "IGNORED: $cmd ${cmd_args[*]}"
+        ;;
+
+    kill-session|kill-server)
+        log "IGNORED: $cmd ${cmd_args[*]}"
+        ;;
+
+    # ── Passthrough to cmux tmux-compat layer ────────────────────────
+    wait-for|swap-pane|break-pane|join-pane|pipe-pane|respawn-pane|\
+    set-buffer|paste-buffer|list-buffers|set-hook|rename-window|\
+    last-pane|last-window|next-window|previous-window|find-window|clear-history)
+        cmux "$cmd" "${cmd_args[@]}" 2>/dev/null || true
+        ;;
+
+    # ── Unknown — passthrough to real tmux ───────────────────────────
+    *)
+        log "PASSTHROUGH: $cmd ${cmd_args[*]}"
+        exec "$REAL_TMUX" "$@"
+        ;;
+esac
+
+exit 0
