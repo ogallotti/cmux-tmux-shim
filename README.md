@@ -15,7 +15,7 @@ tmux capture-pane -t %1 →   cmux capture-pane --surface surface:N
 tmux list-panes         →   Returns only mapped panes (no tab leaks)
 ```
 
-The shim maintains a `%N → surface:N` ID mapping so all commands target the correct cmux surfaces.
+The shim maintains a `%N → cmux surface` ID mapping so all commands target the correct cmux surfaces. Works with both surface refs (`surface:N`) and UUIDs.
 
 ## Requirements
 
@@ -77,8 +77,10 @@ There's an [open PR](https://github.com/manaflow-ai/cmux/pull/1102) to add this 
 | | This shim | PR #1102 |
 |-|-|-|
 | Setup | Manual (install.sh) | Zero config (bundled) |
+| Surface IDs | Works with UUIDs and refs | Refs only |
 | list-panes | Only mapped panes (no tab leaks) | All panes |
 | split-window -t | Respects target (relative split) | Ignores target |
+| Session detection | Auto-resets stale state across sessions | Manual |
 | Dependencies | Bash only | Requires python3 |
 | Layout | Forced vertical stacking | Follows agent request |
 

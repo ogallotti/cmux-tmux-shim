@@ -75,29 +75,36 @@ resolve_pane() {
 }
 
 # Resolve current surface: CMUX_SURFACE_ID can be a UUID or a ref
+# cmux CLI accepts both formats, so pass through as-is
 resolve_current_surface() {
-    local sid="${CMUX_SURFACE_ID:-}"
-    if [[ -z "$sid" ]]; then
-        echo "surface:1"
-        return
-    fi
-    if [[ "$sid" == surface:* ]]; then
-        echo "$sid"
-        return
-    fi
-    local ref
-    ref=$(cmux identify 2>/dev/null | grep -o '"surface_ref" *: *"[^"]*"' | head -1 | grep -o 'surface:[0-9]*')
-    echo "${ref:-surface:1}"
+    echo "${CMUX_SURFACE_ID:-surface:1}"
 }
 
-# Ensure leader pane (%0) is mapped. Trusted once set, never reset.
+# Ensure leader pane (%0) is mapped.
+# Detects new sessions by comparing stored surface with current.
+# If different and we're the leader process, reset state.
 ensure_leader_mapped() {
+    local current_surface
+    current_surface=$(resolve_current_surface)
     local stored
     stored=$(lookup_surface "%0")
-    [[ -n "$stored" ]] && return 0
-    local surface
-    surface=$(resolve_current_surface)
-    store_map "%0" "$surface"
+    if [[ -n "$stored" ]]; then
+        if [[ "$stored" == "$current_surface" ]]; then
+            return 0
+        fi
+        # Stored surface differs from current — could be:
+        # 1. New session (leader changed) → reset
+        # 2. Teammate calling the shim → don't reset
+        # Check: if stored surface still reachable via cmux, it's a teammate call
+        if cmux read-screen --surface "$stored" --lines 1 >/dev/null 2>&1; then
+            return 0  # Leader still alive, we're a teammate
+        fi
+        # Leader surface gone → stale state, reset
+        log "STALE SESSION: $stored gone — resetting"
+        echo "0" > "$COUNTER_FILE"
+        : > "$PANE_MAP"
+    fi
+    store_map "%0" "$current_surface"
 }
 
 ensure_leader_mapped
